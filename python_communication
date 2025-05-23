@@ -1,0 +1,41 @@
+# 导入必要的库
+import serial  # 用于串口通信，实现与Arduino的数据接收
+import wave    # 用于生成WAV音频文件，处理音频格式和写入
+import sys     # 系统相关功能（代码中未直接使用，可能用于后续扩展错误处理）
+
+# ====== 配置参数 ======
+SERIAL_PORT = 'COM5'   # 串口端口，需与Arduino连接的端口一致（Windows为COMx，Linux/Mac为/dev/ttyxxx）
+BAUD_RATE = 115200     # 串口波特率，需与Arduino设置一致以确保正确解码数据
+OUTPUT_FILENAME = 'recording.wav'  # 输出音频文件名
+SAMPLE_RATE = 8000     # 采样率（Hz），需与Arduino的ADC采样率一致以保持音频速度正确
+
+# ====== 初始化串口 ======
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE)  
+# 创建串口对象，设置端口和波特率，建立与Arduino的通信连接
+
+# ====== 配置WAV文件 ======
+with wave.open(OUTPUT_FILENAME, 'wb') as wav_file:  
+    # 使用wave库以二进制写入模式打开文件，with语句确保文件正确关闭
+    
+    # 设置WAV文件参数
+    wav_file.setnchannels(1)   # 单声道音频（1通道）
+    wav_file.setsampwidth(2)   # 每个采样点占2字节（16位深度，对应Arduino的int16格式）
+    wav_file.setframerate(SAMPLE_RATE)  # 设置采样率，影响音频播放速度
+    
+    print("录音中... 按Ctrl+C停止")  # 提示用户开始录音
+    
+    try:
+        while True:  # 持续录音直到用户中断
+            # 从串口读取2字节数据（一个16位采样点）
+            data = ser.read(2)  
+            # ser.read()会阻塞直到收到指定字节数，确保每个音频帧完整
+            
+            if len(data) != 2:  # 校验数据完整性
+                break           # 若数据不完整（如串口断开），退出循环
+            
+            wav_file.writeframes(data)  # 将二进制音频数据写入WAV文件
+            
+    except KeyboardInterrupt:  # 捕获用户按Ctrl+C的中断信号
+        print("录音结束")       # 友好提示录音终止
+
+ser.close()  # 关闭串口连接，释放资源
