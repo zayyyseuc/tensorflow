@@ -1,0 +1,281 @@
+# -*- coding: utf-8 -*-
+"""
+强化版音频分类系统（纯Keras版本，仅支持WAV）
+核心功能：基于梅尔频谱特征的深度学习音频分类系统
+输入要求：16位PCM WAV格式，采样率16000Hz
+系统组件：
+1. 音频预处理模块（梅尔频谱转换+标准化）
+2. 数据管道构建模块（自动数据集划分+高效加载）
+3. 双路径卷积神经网络（高频/低频特征融合）
+4. 训练流程（包含早停和模型保存）
+"""
+
+# =====================
+# 基础库导入
+# =====================
+import os  # 文件系统操作：用于路径处理和目录遍历
+import numpy as np  # 数值计算：处理数组和矩阵运算
+import tensorflow as tf  # 深度学习框架：提供张量计算和神经网络构建
+from keras import layers, Model, optimizers, callbacks  # Keras组件：构建模型和训练流程
+import sys  # 系统相关功能：处理命令行参数和系统配置
+import io  # 输入输出流处理：解决编码问题
+
+# 设置标准输出编码为UTF-8（确保终端能正确显示中文）
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='UTF-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='UTF-8')
+
+# =====================
+# 配置区（用户必须修改部分）
+# =====================
+DATASET_PATH = r"C:/Users/A/Desktop/opencv/sound"  # 数据集根目录路径（需包含按类别命名的子目录）
+CLASS_NAMES = ['A11', 'A12', 'A13', 'A21', 'A22',  # 分类标签列表（需与目录前缀严格匹配）
+               'B1', 'B2', 'B3', 'B4',
+               'C11', 'C12', 'C21', 'C22']  # 示例类别（根据实际数据集调整）
+
+# =====================
+# 数据预处理模块
+# =====================
+def audio_preprocess(file_path, label):
+    """音频预处理流水线（TensorFlow图模式）
+    功能：将原始WAV转换为标准化的梅尔频谱
+    实现原理：
+    1. 读取解码：使用tf.io读取二进制文件，tf.audio解码为波形
+    2. 长度标准化：通过截断/补零统一为4秒（64000样本）
+    3. 频谱生成：STFT计算幅度谱，线性转梅尔频率
+    4. 标准化处理：对数压缩后执行Z-score标准化
+    """
+    try:
+        # 阶段1：读取和解码 ------------------------------------------
+        raw_audio = tf.io.read_file(file_path)  # 读取二进制文件到张量
+        audio, sample_rate = tf.audio.decode_wav(raw_audio, desired_channels=1)  # 解码为单声道波形
+        audio = tf.squeeze(audio, axis=-1)  # 去除冗余维度（从[None,1]变为[None]）  是数据量变小
+
+        # 阶段2：长度标准化 ------------------------------------------
+        target_length = 16000 * 4  # 目标样本数（4秒*16kHz）
+        current_length = tf.shape(audio)[0]
+        audio = audio[:target_length]  # 截断超长部分
+        pad_length = tf.maximum(target_length - current_length, 0)  # 计算需要填充的长度
+        audio = tf.pad(audio, [[0, pad_length]])  # 尾部补零保持长度一致
+
+        # 阶段3：频谱转换 ------------------------------------------
+        # 短时傅里叶变换（STFT参数经过声学优化）
+        stfts = tf.signal.stft(
+            audio, 
+            frame_length=1024,   # 窗口长度：平衡时间/频率分辨率
+            frame_step=512,      # 滑动步长：影响频谱图的时间分辨率
+            fft_length=1024      # FFT点数：决定频率分辨率
+        )
+        spectrogram = tf.abs(stfts)  # 取复数绝对值得到幅度谱
+
+        # 创建梅尔滤波器组（将线性Hz转换为梅尔刻度）    去除噪声
+        mel_matrix = tf.signal.linear_to_mel_weight_matrix(
+            num_mel_bins=128,            # 梅尔带数量（影响特征维度）
+            num_spectrogram_bins=513,    # 对应STFT输出的频率bin数（N/2+1）
+            sample_rate=16000,           # 输入音频采样率
+            lower_edge_hertz=80.0,       # 最低频率（滤除低频噪声）
+            upper_edge_hertz=7600.0      # 最高频率（保留语音主要能量）
+        )
+
+        # 应用梅尔滤波器（矩阵乘法实现频率转换）
+        mel_spectrogram = tf.tensordot(spectrogram, mel_matrix, 1)
+        log_mel = tf.math.log(mel_spectrogram + 1e-6)  # 对数压缩（模拟人耳对数感知）
+
+        # 阶段4：数据标准化 ----------------------------------------
+        # 计算频谱的均值和方差（每个梅尔带独立计算）
+        mean, variance = tf.nn.moments(log_mel, axes=[0,1])
+        # Z-score标准化（使数据分布零均值单位方差）
+        normalized = (log_mel - mean) / tf.sqrt(variance + 1e-6)
+
+        return normalized, label
+
+    except Exception as e:
+        # 错误处理：返回全零矩阵避免训练中断
+        tf.print(f"处理失败: {file_path}, 错误: {str(e)}")
+        return tf.zeros((124, 128), dtype=tf.float32), label
+
+# =====================
+# 数据管道构建
+# =====================
+def build_datasets(data_dir, batch_size=32):
+    """构建高效数据流水线
+    功能实现：
+    1. 递归扫描数据集目录结构
+    2. 收集文件路径和对应标签
+    3. 8:2比例随机划分训练/验证集
+    4. 创建支持并行预处理的Dataset对象
+    关键技术：
+    - tf.data API实现流水线优化
+    - 自动过滤无效样本
+    - 预取机制提升GPU利用率
+    """
+    print(f"\n正在扫描数据集路径: {os.path.abspath(data_dir)}")
+
+    # 阶段1：文件收集 ----------------------------------------------
+    file_paths = []  # 存储所有有效WAV文件路径
+    labels = []      # 存储对应类别索引（整数形式）
+    
+    # 遍历每个类别目录（目录命名格式：类别名_samples）
+    for class_idx, class_name in enumerate(CLASS_NAMES):
+        class_dir = os.path.join(data_dir, f"{class_name}_samples")
+        if not os.path.exists(class_dir):
+            raise FileNotFoundError(f"目录不存在: {class_dir}")
+            
+        # 递归搜索所有WAV文件（支持子目录结构）
+        for root, _, files in os.walk(class_dir):
+            for file in files:
+                if file.lower().endswith('.wav'):
+                    file_paths.append(os.path.join(root, file))
+                    labels.append(class_idx)  # 使用枚举索引作为标签
+
+    # 空数据集检查
+    if len(file_paths) == 0:
+        raise FileNotFoundError("未找到任何WAV音频文件，请检查路径和文件格式")
+
+    # 阶段2：数据随机化 --------------------------------------------
+    # 生成随机排列索引（保证文件与标签对应关系）
+    indices = np.random.permutation(len(file_paths))
+    file_paths = np.array(file_paths)[indices]
+    labels = np.array(labels)[indices]
+
+    # 阶段3：数据集划分 --------------------------------------------
+    split = int(0.8 * len(file_paths))  # 80%训练，20%验证
+    train_files = file_paths[:split]
+    train_labels = labels[:split]
+    val_files = file_paths[split:]
+    val_labels = labels[split:]
+
+    # 打印统计信息（帮助用户验证数据加载）
+    print(f"数据集统计:")
+    print(f"- 总样本数: {len(file_paths)}")
+    print(f"- 训练集: {len(train_files)}")
+    print(f"- 验证集: {len(val_files)}")
+
+    # 阶段4：Dataset流水线构建 ---------------------------------------
+    def create_dataset(files, labels):
+        """创建优化数据流水线
+        处理流程：
+        1. 从内存数据创建基础Dataset
+        2. 并行映射预处理函数（充分利用多核CPU）
+        3. 过滤全零频谱（处理失败的样本）
+        4. 批量处理（组织成小批量数据）
+        5. 预取机制（实现计算与数据加载流水线化）
+        """
+        return tf.data.Dataset.from_tensor_slices((files, labels)) \
+            .map(audio_preprocess, num_parallel_calls=tf.data.AUTOTUNE) \
+            .filter(lambda x,y: tf.reduce_sum(x) != 0.0)\
+            .batch(batch_size) \
+            .prefetch(tf.data.AUTOTUNE)  # 自动优化缓冲区大小
+
+    return create_dataset(train_files, train_labels), create_dataset(val_files, val_labels)
+
+# =====================
+# 神经网络模型
+# =====================
+def create_model(input_shape=(124, 128)):
+    """构建双路径卷积神经网络
+    架构设计要点：
+    - 高频路径：3x3小卷积核捕捉局部特征（如音素细节）
+    - 低频路径：5x5大卷积核捕捉全局特征（如语调模式）
+    - 特征融合：拼接双路径特征图增强表征能力
+    - 全局池化：替代全连接层减少参数量
+    参数说明：
+    input_shape : 梅尔频谱维度（时间步×梅尔带数）
+    """
+    # 输入层（适应预处理后的频谱形状）
+    inputs = layers.Input(shape=input_shape)
+    
+    # 增加通道维度（将二维频谱转换为三维张量 [H, W, C]）        增加可靠性
+    x = layers.Reshape(input_shape + (1,))(inputs)
+    
+    # 高频特征路径（捕捉局部时频模式）-------------------------------------
+    high = layers.Conv2D(32, (3,3), padding='same', activation='relu')(x)  # 保持空间维度
+    high = layers.MaxPool2D((2, 2))(high)  # 下采样时间维度（减少计算量）
+
+    # 低频特征路径（捕捉宽频带特征）-------------------------------------
+    low = layers.Conv2D(32, (5,5), padding='same', activation='relu')(x)  # 大感受野
+    low = layers.MaxPool2D((2, 4))(low)     # 更大步长压缩频带维度
+    low = layers.UpSampling2D((1, 2))(low)  # 上采样对齐特征图高度
+
+    # 特征融合 ---------------------------------------------------
+    merged = layers.Concatenate(axis=-1)([high, low])  # 通道维度拼接（双路特征组合）
+    merged = layers.Conv2D(64, (3,3), activation='relu')(merged)  # 融合卷积
+    merged = layers.GlobalAvgPool2D()(merged)  # 空间平均（得到通道特征向量）
+
+    # 输出层 -----------------------------------------------------
+    outputs = layers.Dense(len(CLASS_NAMES), activation='softmax')(merged)  # 多分类输出
+    
+    # 模型编译（配置训练参数）
+    model = Model(inputs, outputs)
+    return model
+
+# =====================
+# 训练流程
+# =====================
+def main():
+    """端到端训练流程控制器
+    功能模块：
+    - 数据集加载与验证
+    - 模型构建与编译
+    - 训练过程监控
+    - 模型保存与异常处理
+    """
+    try:
+        # 阶段1：数据集初始化 --------------------------------------
+        print("\n====== 正在加载数据集 ======")
+        train_dataset, val_dataset = build_datasets(DATASET_PATH)
+
+        # 阶段2：模型构建 ------------------------------------------
+        print("\n====== 正在构建模型 ======")
+        model = create_model()
+        model.compile(
+            optimizer=optimizers.Adam(learning_rate=0.001),  # 自适应学习率优化器
+            loss='sparse_categorical_crossentropy',          # 稀疏分类交叉熵损失
+            metrics=['accuracy']                             # 监控分类准确率
+        )
+        model.summary()  # 打印模型结构信息
+
+        # 阶段3：回调配置 -----------------------------------------
+        callbacks_list = [
+            # 早停策略（当验证集性能停止提升时终止训练）
+            callbacks.EarlyStopping(
+                patience=10,         # 容忍10个epoch无改善
+                restore_best_weights=True  # 恢复最佳模型权重
+            ),
+            # 自动保存最佳模型（基于验证准确率）
+            callbacks.ModelCheckpoint(
+                'best_model.keras',             #训练模型文件的地址
+                save_best_only=True,  # 仅保留最优模型
+                monitor='val_accuracy',  # 监控指标
+                mode='max'  # 取指标最大值
+            )
+        ]
+
+        # 阶段4：模型训练 -----------------------------------------
+        print("\n====== 开始训练 ======")
+        history = model.fit(
+            train_dataset,
+            validation_data=val_dataset,
+            epochs=100,                # 最大训练轮次（可能被早停终止）
+            callbacks=callbacks_list,  # 启用回调功能
+            verbose=2                 # 简洁训练日志（每个epoch一行）
+        )
+
+        # 阶段5：训练结果输出 --------------------------------------
+        print("\n====== 训练完成 ======")
+        print(f"最佳验证准确率: {max(history.history['val_accuracy']):.4f}")
+
+    except Exception as e:
+        # 异常处理模块（捕获并指导用户排查问题）
+        print("\n====== 发生错误 ======")
+        print(f"错误类型: {type(e).__name__}")
+        print(f"错误详情: {str(e)}")
+        print("\n排错建议:")
+        print("1. 确认已安装 keras、tensorflow 及相关依赖")
+        print("2. 检查DATASET_PATH路径是否正确（注意反斜杠转义）")
+        print("3. 确认所有类别目录都存在（命名格式：类别名_samples）")
+        print("4. 确保音频文件为16位PCM WAV格式，采样率16000Hz")
+        print("5. 检查文件扩展名是否为.wav且文件未损坏")
+
+# 程序入口
+if __name__ == "__main__":
+    main()
