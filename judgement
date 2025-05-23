@@ -1,0 +1,132 @@
+# -*- coding: utf-8 -*-
+"""
+音频分类预测脚本（需与训练好的模型配合使用）
+功能：加载预训练模型，对指定音频文件进行分类预测
+环境要求：tensorflow >= 2.10, numpy
+使用方法：修改配置区的CLASS_NAMES（类别标签）和MODEL_PATH（模型路径）
+"""
+
+# =====================
+# 基础库导入
+# =====================
+import tensorflow as tf  # 深度学习框架，用于模型加载和音频处理（实现音频解码、频谱计算等核心功能）
+import numpy as np       # 数值计算库，用于数组操作（处理预测结果的概率分布）
+import os                # 操作系统接口，用于文件路径校验（验证输入文件是否存在）
+
+# =====================
+# 配置区（必须修改！）
+# =====================
+CLASS_NAMES = ['A11', 'A12', 'A13', 'A21', 'A22',
+               'B1', 'B2', 'B3', 'B4',
+               'C11', 'C12', 'C21', 'C22']  # 类别标签（必须与训练时的顺序完全一致，决定预测结果的映射关系）
+MODEL_PATH = 'best_model.keras'             # 训练保存的模型文件路径（支持.h5或.keras格式，需包含完整的网络架构和权重）
+
+# =====================
+# 核心预测函数
+# =====================
+def predict_audio(file_path):
+    """音频分类预测函数
+    功能：实现端到端的音频分类预测流程
+    参数：
+        file_path: 待预测的.wav文件路径（16位PCM格式，16000Hz采样率）
+    返回：
+        predicted_class: 预测的类别名称（失败时返回None）
+    """
+    try:
+        # ---------------------
+        # 1. 文件存在性校验
+        # ---------------------
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"文件不存在: {file_path}")  # 主动抛出异常阻止后续流程
+
+        # ---------------------
+        # 2. 模型加载
+        # ---------------------
+        # 加载预训练的Keras模型（包含网络结构和权重）
+        # tf.keras.models.load_model会自动重建网络结构并加载权重
+        model = tf.keras.models.load_model(MODEL_PATH)
+        
+        # ---------------------
+        # 3. 音频预处理（必须与训练时完全一致）
+        # ---------------------
+        # 3.1 读取并解码音频文件
+        audio = tf.io.read_file(file_path)  # 读取二进制文件（返回Tensor对象）
+        # 解码WAV文件（返回音频张量和采样率）
+        # desired_channels=1确保转换为单声道，采样率自动从文件头读取
+        audio, sample_rate = tf.audio.decode_wav(audio, desired_channels=1)
+        # 移除单维度通道（从形状[samples, 1]变为[samples]）
+        audio = tf.squeeze(audio, axis=-1)  # 简化后续处理流程
+        
+        # 3.2 统一音频长度为4秒（16000Hz * 4s = 64000个采样点）
+        target_length = 16000 * 4  # 计算目标采样点数
+        current_length = tf.shape(audio)[0]  # 获取实际音频长度
+        audio = audio[:target_length]  # 截断超过4秒的部分（使用切片操作）
+        pad_length = tf.maximum(target_length - current_length, 0)  # 计算需要填充的长度（防止负数）
+        audio = tf.pad(audio, [[0, pad_length]])  # 末尾补零（使用二维填充格式[[前填充，后填充]]）
+        
+        # 3.3 生成梅尔频谱特征（关键特征提取步骤）
+        # 短时傅里叶变换（STFT）将时域信号转为时频信号
+        stfts = tf.signal.stft(audio, 
+                              frame_length=1024,   # 每帧1024个采样点（约64ms）
+                              frame_step=512,      # 帧移512点（50%重叠，平衡时频分辨率）
+                              fft_length=1024)     # FFT点数（决定频域分辨率）
+        spectrogram = tf.abs(stfts)  # 计算幅度谱（复数转实数，形状为[帧数, 513]）
+        
+        # 创建梅尔滤波器矩阵（将线性频率转换为符合人耳感知的梅尔刻度）
+        mel_matrix = tf.signal.linear_to_mel_weight_matrix(
+            num_mel_bins=128,            # 梅尔带数（与训练时一致，决定特征维度）
+            num_spectrogram_bins=513,    # 频谱bin数（由fft_length//2 +1计算得到）
+            sample_rate=16000,           # 采样率（需与音频文件实际采样率一致）
+            lower_edge_hertz=80.0,       # 最低频率（过滤低频噪声）
+            upper_edge_hertz=7600.0      # 最高频率（保留语音主要能量）
+        )
+        
+        # 3.4 特征标准化（提升模型鲁棒性）
+        mel_spectrogram = tf.tensordot(spectrogram, mel_matrix, 1)  # 矩阵乘法转换到梅尔域（形状变为[帧数, 128]）
+        log_mel = tf.math.log(mel_spectrogram + 1e-6)  # 取对数（压缩动态范围，+1e-6防止对零取对数）
+        # 计算均值和方差进行标准化（使输入数据符合零均值单位方差）
+        mean, variance = tf.nn.moments(log_mel, axes=0)  # 沿时间轴计算统计量
+        normalized = (log_mel - mean) / tf.sqrt(variance + 1e-6)  # 标准化公式，+1e-6防止除零
+        
+        # 3.5 调整输入维度（适配模型输入形状）
+        # 添加批次维度（模型预期输入形状为[批次大小, 时间步, 特征维度, 通道数]）
+        input_tensor = tf.expand_dims(normalized, axis=0)  # 从[Time, Mel]变为[1, Time, Mel]
+        input_tensor = tf.expand_dims(input_tensor, axis=-1)  # 添加通道维度变为[1, Time, Mel, 1]
+        
+        # ---------------------
+        # 4. 执行预测
+        # ---------------------
+        predictions = model.predict(input_tensor)  # 前向传播（返回概率分布数组，形状为[1, 类别数]）
+        predicted_class = CLASS_NAMES[np.argmax(predictions)]  # 取概率最大的索引并转换为类别名
+        confidence = np.max(predictions) * 100  # 计算置信度（最大概率值转百分比）
+        
+        # 打印人类可读结果
+        print(f"\n预测结果：{predicted_class}（可信度：{confidence:.1f}%）")
+        return predicted_class
+        
+    except Exception as e:
+        # 异常处理（给出详细排错建议）
+        print(f"\n预测失败：{str(e)}")
+        print("排错建议：")
+        print("1. 确认文件是16位PCM WAV格式（可使用Audacity查看/转换）")
+        print("2. 确认采样率为16000Hz（查看方法：右键文件->属性->详细信息）")
+        print("3. 检查模型文件路径是否正确")
+        print("4. 检查CLASS_NAMES是否与训练时完全一致（包括顺序）")
+        return None
+
+# =====================
+# 使用示例
+# =====================
+if __name__ == "__main__":
+    # 示例测试文件（修改为实际路径）
+    test_file = "C:/Users/A/Desktop/opencv/test.wav"
+    
+    # 打印配置信息（帮助用户验证配置）
+    print("===== 音频分类预测器 =====")
+    print(f"当前配置：")
+    print(f"- 类别数量: {len(CLASS_NAMES)}")
+    print(f"- 模型位置: {os.path.abspath(MODEL_PATH)}")  # 显示绝对路径便于验证
+    
+    # 执行预测
+    predict_audio(test_file)
+    print("\n提示：可以修改脚本开头的CLASS_NAMES和MODEL_PATH配置")
