@@ -1,0 +1,104 @@
+# evaluate_model_all.py
+# -*- coding: utf-8 -*-
+"""
+遍历所有子文件夹下的 .wav，批量验证 best_model.keras
+"""
+
+import os
+import sys
+import numpy as np
+import pandas as pd
+import librosa
+import tensorflow as tf
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+
+# ====== 配置区 ======
+MODEL_PATH   = r"D:\opencv\tensorflow_scripts\best_model.keras"
+AUDIO_DIR    = r"D:\opencv\scripts\selected_samples"
+OUTPUT_CSV   = r"D:\opencv\tensorflow_scripts\confidence_report_all.csv"
+SAMPLE_RATE  = 16000
+
+# 创建输出目录
+os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
+
+# ====== 加载模型 & 获取输入形状 ======
+print(f"加载模型：{MODEL_PATH}")
+model = tf.keras.models.load_model(MODEL_PATH)
+_, TARGET_FRAMES, TARGET_MELS = model.input_shape
+print(f"模型期望输入：(frames × mels) = {TARGET_FRAMES} × {TARGET_MELS}")
+
+# ====== 特征提取函数 ======
+def extract_features(wav_path, sr=SAMPLE_RATE):
+    y, _ = librosa.load(wav_path, sr=sr, mono=True)
+    target_len = sr * 4
+    if len(y) >= target_len:
+        y = y[:target_len]
+    else:
+        y = np.pad(y, (0, target_len - len(y)), mode='constant')
+    stft = librosa.stft(y, n_fft=1024, hop_length=512, win_length=1024)
+    spec = np.abs(stft)
+    mel_basis = librosa.filters.mel(sr=sr, n_fft=1024,
+                                    n_mels=TARGET_MELS,
+                                    fmin=80, fmax=7600)
+    mel_spec = np.dot(mel_basis, spec)
+    log_mel = np.log(mel_spec + 1e-6)
+    mean, std = log_mel.mean(), log_mel.std() + 1e-6
+    norm = (log_mel - mean) / std  # shape (mels, t)
+    feat = norm.T.astype(np.float32)  # shape (t, mels)
+    t = feat.shape[0]
+    if t >= TARGET_FRAMES:
+        return feat[:TARGET_FRAMES, :]
+    else:
+        padding = np.zeros((TARGET_FRAMES - t, TARGET_MELS), dtype=np.float32)
+        return np.vstack([feat, padding])
+
+# ====== 递归扫描所有 .wav 文件 ======
+file_paths = []
+labels     = []
+for root, _, files in os.walk(AUDIO_DIR):
+    # root 示例：D:\opencv\scripts\selected_samples\A11_samples
+    for fn in files:
+        if fn.lower().endswith(".wav"):
+            file_paths.append(os.path.join(root, fn))
+            # 以父目录名作为标签
+            labels.append(os.path.basename(root))
+
+if not file_paths:
+    print("未在 AUDIO_DIR 下找到任何 .wav 文件，请检查路径。")
+    sys.exit(1)
+
+print(f"共收集到 {len(file_paths)} 条音频，涉及 {len(set(labels))} 个类别。")
+
+# ====== 特征矩阵构建 ======
+print("开始提取特征...")
+X = np.stack([extract_features(p) for p in file_paths], axis=0)
+# 得到形状 (N, TARGET_FRAMES, TARGET_MELS)
+
+# ====== 标签映射 ======
+class_names = sorted(set(labels))
+label_to_idx = {name: idx for idx, name in enumerate(class_names)}
+y_true = np.array([label_to_idx[l] for l in labels], dtype=np.int32)
+
+# ====== 模型推断 ======
+print("开始模型推断...")
+probs = model.predict(X, batch_size=16, verbose=1)
+y_pred = np.argmax(probs, axis=1)
+y_conf = np.max(probs, axis=1)
+
+# ====== 评估 & 输出 ======
+acc = accuracy_score(y_true, y_pred)
+print(f"\n总体准确率: {acc*100:.2f}%\n")
+print("分类报告：")
+print(classification_report(y_true, y_pred, target_names=class_names))
+print("混淆矩阵：")
+print(confusion_matrix(y_true, y_pred))
+
+# ====== 保存 CSV ======
+df = pd.DataFrame({
+    "file": file_paths,
+    "true": [class_names[i] for i in y_true],
+    "pred": [class_names[i] for i in y_pred],
+    "conf": y_conf
+})
+df.to_csv(OUTPUT_CSV, index=False, encoding='utf-8-sig')
+print(f"\n已保存完整预测结果与置信度至：{OUTPUT_CSV}")
