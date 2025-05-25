@@ -10,6 +10,7 @@ import librosa
 import matplotlib.pyplot as plt
 from scipy import signal
 from scipy.stats import kurtosis, skew
+import librosa.display
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -30,6 +31,8 @@ class AudioFeatureAnalyzer:
         """
         # 加载音频
         audio, sr = librosa.load(audio_path, sr=self.sample_rate)
+        #强制转为numpy.ndarray
+        audio = np.asarray(audio, dtype=float)
         
         features = {}
         
@@ -119,6 +122,9 @@ class AudioFeatureAnalyzer:
     
     def _extract_spectral_features(self, audio, sr):
         """提取频谱特征"""
+        #确保类型一致
+        audio = np.asarray(audio, dtype=float)
+
         features = {}
         
         # 计算STFT
@@ -129,7 +135,7 @@ class AudioFeatureAnalyzer:
         spectral_centroid = librosa.feature.spectral_centroid(y=audio, sr=sr)[0]
         features['spectral_centroid_mean'] = np.mean(spectral_centroid)
         features['spectral_centroid_std'] = np.std(spectral_centroid)
-        features['spectral_centroid_range'] = np.max(spectral_centroid) - np.min(spectral_centroid)
+        features['spectral_centroid_range'] = float(np.max(spectral_centroid) - np.min(spectral_centroid))
         
         # 频谱带宽
         spectral_bandwidth = librosa.feature.spectral_bandwidth(y=audio, sr=sr)[0]
@@ -174,6 +180,7 @@ class AudioFeatureAnalyzer:
         return features
     
     def _extract_mel_features(self, audio, sr):
+        audio = np.asarray(audio, dtype=float)
         """提取梅尔频谱特征"""
         features = {}
         
@@ -199,7 +206,8 @@ class AudioFeatureAnalyzer:
     def _extract_rhythm_features(self, audio, sr):
         """提取节奏特征"""
         features = {}
-        
+        audio = np.asarray(audio, dtype=float)
+
         # 节拍跟踪
         try:
             tempo, beats = librosa.beat.beat_track(y=audio, sr=sr)
