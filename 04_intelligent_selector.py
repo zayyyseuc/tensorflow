@@ -17,6 +17,17 @@ from datetime import datetime
 from scipy import signal
 from scipy.stats import kurtosis, skew
 
+# 自定义 JSON Encoder，用于处理 numpy 类型
+class NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        # numpy 标量，例如 np.float32、np.int64
+        if isinstance(obj, np.generic):
+            return obj.item()
+        # numpy 数组
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
 # 导入我们的音频分析器
 from audio_analyzer import AudioFeatureAnalyzer
 
@@ -778,10 +789,11 @@ class IntelligentAudioSelectorV2:
             'source_file': str(audio_path),
             'source_dataset': source_dataset,
             'target_scene': scene_id,
-            'match_score': score,
+            'match_score': float(score),
             'output_file': str(output_path),
             'key_features': {
-                k: v for k, v in features.items() 
+                k: float(v) 
+                for k, v in features.items() 
                 if k in ['water_sound_likelihood', 'bird_sound_likelihood', 
                         'traffic_presence', 'human_activity_diversity']
             }
@@ -939,7 +951,7 @@ class IntelligentAudioSelectorV2:
             simplified_log.append(simplified_entry)
         
         with open(log_path, 'w', encoding='utf-8') as f:
-            json.dump(simplified_log, f, indent=2, ensure_ascii=False)
+            json.dump(simplified_log, f, indent=2, ensure_ascii=False,cls=NpEncoder)
     
     def process_urbansound8k(self, dataset_path):
         """处理UrbanSound8K数据集，使用改进的策略"""
