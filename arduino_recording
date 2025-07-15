@@ -1,0 +1,77 @@
+#include <SPI.h>             // 引入SPI通信库，用于与INMP441数字麦克风进行数据交换
+#include <HardwareTimer.h>   // 引入硬件定时器库，用于生成精确的采样时钟信号
+
+#define SAMPLE_RATE 16000    // 定义音频采样率：16kHz（适合语音采集）
+#define BUFFER_SIZE 512      // 定义音频缓冲区大小（存储512个16位采样点）
+
+// 硬件引脚配置（STM32F103C8T6开发板）
+#define SPI_SCK  PA5         // SPI时钟信号线（同步数据传输）
+#define SPI_MISO PA6         // SPI主机输入从机输出线（接收麦克风数据）
+#define SPI_WS   PA4         // 字选择信号线（控制声道选择/数据帧同步）
+
+volatile int16_t audioBuffer[BUFFER_SIZE]; // 音频数据缓冲区（存储16位有符号PCM数据）
+volatile int bufIndex = 0;   // 缓冲区当前索引（volatile确保中断安全访问）
+bool debugOutput = true;     // 调试标志（控制是否输出前100个样本原始数据）
+
+SPIClass spi(PA7, PA6, PA5); // 初始化SPI实例（参数顺序：MOSI, MISO, SCK）
+
+void setup() {
+  Serial.begin(2000000);     // 初始化串口通信（波特率2Mbps确保高速数据传输）
+  
+  // SPI外设配置
+  spi.begin();               // 启动SPI接口（使能硬件SPI控制器）
+  spi.setBitOrder(LSBFIRST); // 设置低位优先传输（符合INMP441通信协议）
+  spi.setDataMode(SPI_MODE3);// 使用SPI模式3（CPOL=1时钟空闲高电平，CPHA=1在第二个边沿采样）
+  spi.setClockDivider(SPI_CLOCK_DIV8); // 设置SPI时钟2MHz（主频16MHz/8）
+
+  // 配置WS信号生成（INMP441要求2倍采样率的双相时钟）
+  pinMode(SPI_WS, OUTPUT);   // 设置WS引脚为输出模式
+  HardwareTimer *timer = new HardwareTimer(TIM1); // 实例化TIM1定时器
+  timer->setOverflow(SAMPLE_RATE*2, HERTZ_FORMAT); // 设置中断频率32kHz（16kHz x 2）
+  timer->attachInterrupt([](){ digitalToggle(SPI_WS); }); // 中断回调：翻转WS电平
+  timer->resume();           // 启动定时器（生成连续的16kHz双相时钟）
+  
+  // 麦克风初始化序列
+  delay(100);                // 等待麦克风上电稳定（100ms启动延时）
+  digitalWrite(SPI_WS, HIGH);// WS置高进入控制模式（区别于普通音频模式）
+  spi.transfer16(0x801E);    // 发送配置命令：0x801E（启动设备+右对齐+16kHz采样）
+  delay(10);                 // 等待配置生效（10ms稳定时间）
+}
+
+void loop() {
+  static uint32_t lastTime = 0; // 时间追踪器（记录上次采样时间）
+  
+  // 精确采样率控制（62.5us间隔对应16kHz采样率）
+  if (micros() - lastTime >= 62) { 
+    lastTime = micros();        // 更新时间戳
+    
+    // 读取24位原始音频数据（INMP441输出格式）
+    uint32_t data = 0;
+    data |= spi.transfer(0) << 16; // 发送0x00，读取最高字节（MSB）
+    data |= spi.transfer(0) << 8;  // 发送0x00，读取中间字节
+    data |= spi.transfer(0);       // 发送0x00，读取最低字节（LSB）
+    
+    // 24→16位格式转换
+    int32_t raw = (int32_t)(data << 8) >> 8; // 符号位扩展（保留最高位符号）
+    int16_t sample = raw >> 8;       // 取有效高16位（舍弃低8位量化噪声）
+    
+    // 调试模式输出（仅前100样本）
+    if (debugOutput && bufIndex < 100) {
+      Serial.print("RAW:");         // 原始24位十六进制值
+      Serial.print(data, HEX);
+      Serial.print(" → SAMPLE:");   // 转换后的16位十进制值
+      Serial.println(sample);
+    }
+    
+    // 数据存入缓冲区
+    audioBuffer[bufIndex++] = sample; // 存储转换后的PCM数据
+    
+    // 缓冲区满处理
+    if (bufIndex >= BUFFER_SIZE) {
+      // 通过串口发送整个缓冲区（二进制格式，BUFFER_SIZE*2字节）
+      Serial.write((uint8_t*)audioBuffer, BUFFER_SIZE*2);
+      bufIndex = 0;       // 重置缓冲区索引
+      debugOutput = false;// 关闭调试输出（只显示前100样本）
+    }
+  }
+}
