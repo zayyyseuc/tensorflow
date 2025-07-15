@@ -1,0 +1,704 @@
+# -*- coding: utf-8 -*-
+"""
+智慧导览系统 - 多模态区域识别系统
+核心功能：
+1. 音频采集与分类（基于预训练模型） - 通过麦克风采集环境声音并使用深度学习模型分类
+2. 图像拍摄与分类（基于双路径CNN） - 通过摄像头拍摄图像并使用CNN模型分类
+3. 多模态结果融合 - 结合音频和图像分类结果进行综合判断
+4. 结果图形化显示 - 可视化展示分析过程和结果
+"""
+
+# =====================
+# 基础库导入
+# =====================
+import os  # 提供操作系统相关功能，如文件路径操作
+import io  # 提供文件IO操作，用于处理文本编码
+import numpy as np  # 数值计算库，用于数组操作和数学运算
+import tensorflow as tf  # 深度学习框架，用于加载和运行神经网络模型
+import serial  # 串口通信库，用于连接音频采集设备
+import wave  # WAV音频文件操作库，用于保存录音
+import time  # 时间相关操作，用于计时和延时
+import sys  # 系统相关功能，如修改标准输出编码
+import requests  # HTTP请求库，用于从ESP32-CAM获取图像
+import cv2  # OpenCV库，用于图像处理（虽然代码中未直接使用）
+import matplotlib.pyplot as plt  # 数据可视化库，用于绘制图表
+from datetime import datetime  # 日期时间处理，用于生成时间戳
+from PIL import Image  # Python图像处理库，用于图像加载和基本处理
+from keras.models import load_model  # 从Keras加载预训练模型
+from keras.preprocessing import image as kimage  # 图像预处理工具
+from matplotlib.backends.backend_agg import FigureCanvasAgg  # Matplotlib后端
+from matplotlib.figure import Figure  # Matplotlib图形对象
+
+# 设置标准输出编码为UTF-8，确保中文正常显示
+# 原理：重定向标准输出流，设置UTF-8编码
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='UTF-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='UTF-8')
+
+# =====================
+# 配置区（用户必须修改部分）
+# =====================
+SAVE_ROOT = "C:/Users/A/Desktop/opencv"  # 所有生成文件的保存根目录
+
+# 子目录配置（使用os.path.join确保跨平台兼容性）
+AUDIO_SAVE_DIR = os.path.join(SAVE_ROOT, "Audio")  # 音频文件保存目录
+IMAGE_SAVE_DIR = os.path.join(SAVE_ROOT, "Images")  # 图像文件保存目录
+LOG_SAVE_DIR = os.path.join(SAVE_ROOT, "SystemLogs")  # 系统日志保存目录
+VISUALIZATION_DIR = os.path.join(SAVE_ROOT, "Results")  # 可视化结果保存目录
+
+# 确保所有目录存在（exist_ok=True表示目录已存在时不报错）
+# 原理：递归创建目录，如果目录已存在则跳过
+os.makedirs(AUDIO_SAVE_DIR, exist_ok=True)
+os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
+os.makedirs(LOG_SAVE_DIR, exist_ok=True)
+os.makedirs(VISUALIZATION_DIR, exist_ok=True)
+
+# 音频配置
+RECORD_PORT = 'COM10'  # 串口端口号，连接音频采集设备
+RECORD_BAUD = 2000000  # 串口波特率，与设备匹配（单位：比特/秒）
+RECORD_CHUNK_SAMPLES = 1024  # 每次从串口读取的音频样本数（影响实时性）
+RECORD_DURATION = 5  # 默认录音时长（秒）
+AUDIO_CLASS_NAMES = ['A11', 'A12', 'A13', 'A21', 'A22', 'B1', 'B2', 'B3', 'B4', 'C11', 'C12', 'C21', 'C22']  # 音频分类标签
+AUDIO_MODEL_PATH = 'best_audio_model.keras'  # 预训练音频模型路径（基于梅尔频谱的CNN模型）
+
+# 图像配置
+ESP32_IP = "192.168.137.96"  # ESP32-CAM的IP地址（需与设备在同一网络）
+RETRY_TIMES = 3  # 拍摄失败时的最大重试次数（提高鲁棒性）
+IMG_SIZE = (240, 320)  # 模型输入尺寸（高度，宽度），需与训练时一致
+CLASS_NAMES = ['A11', 'A12', 'A13', 'A21', 'A22', 'B1', 'B2', 'B3', 'B4', 'C11', 'C12', 'C21', 'C22']  # 图像分类标签
+IMAGE_MODEL_PATH = 'best_image_model.keras'  # 预训练图像模型路径（基于双路径CNN）
+
+# 融合权重（Dempster-Shafer证据理论简化实现）
+AUDIO_WEIGHT = 0.6  # 音频结果权重（基于领域知识设定）
+IMAGE_WEIGHT = 0.4  # 图像结果权重（总和应为1）
+
+# =====================
+# 新增图形化显示函数（英文版）
+# =====================
+def plot_audio_waveform(audio_data, sample_rate, save_path=None):
+    """
+    绘制音频波形图（英文标题）
+    功能：显示音频信号的时域特征
+    参数：
+        audio_data: 音频样本数据数组（一维numpy数组）
+        sample_rate: 采样率（Hz），用于计算时间轴
+        save_path: 图片保存路径（可选）
+    原理：通过matplotlib绘制样本点随时间变化的曲线
+    """
+    plt.figure(figsize=(10, 4))  # 创建10英寸宽、4英寸高的图形
+    # 生成时间轴（从0到音频时长，均匀分布len(audio_data)个点）
+    time_axis = np.linspace(0, len(audio_data)/sample_rate, num=len(audio_data))
+    plt.plot(time_axis, audio_data)  # 绘制波形
+    plt.title('Audio Waveform')  # 设置标题
+    plt.xlabel('Time (s)')  # 设置x轴标签
+    plt.ylabel('Amplitude')  # 设置y轴标签
+    plt.grid(True)  # 显示网格
+    
+    if save_path:  # 如果提供了保存路径
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')  # 保存为300dpi的高质量图片
+        plt.close()  # 关闭图形释放内存
+    else:
+        plt.show()  # 否则直接显示图形
+
+def plot_spectrogram(spectrogram, save_path=None):
+    """
+    绘制频谱图（英文标题）
+    功能：显示音频信号的频域特征
+    参数：
+        spectrogram: 频谱数据（2D numpy数组，频率×时间）
+        save_path: 图片保存路径（可选）
+    原理：使用imshow显示频谱能量分布，颜色表示强度
+    """
+    plt.figure(figsize=(10, 4))  # 创建图形
+    # 显示频谱图，aspect='auto'自动调整宽高比，origin='lower'使低频在底部
+    plt.imshow(spectrogram, aspect='auto', origin='lower')
+    plt.title('Spectrogram')  # 标题
+    plt.xlabel('Time')  # x轴标签（帧数）
+    plt.ylabel('Frequency')  # y轴标签（频点）
+    plt.colorbar(format='%+2.0f dB')  # 添加颜色条，显示dB值
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+def plot_class_probabilities(class_names, probabilities, title, save_path=None):
+    """
+    绘制类别概率分布图（英文标题）
+    功能：可视化分类结果的概率分布
+    参数：
+        class_names: 类别名称列表
+        probabilities: 各类别概率值数组（0-100）
+        title: 图表标题
+        save_path: 图片保存路径（可选）
+    原理：绘制柱状图并在每个柱子上方添加数值标签
+    """
+    plt.figure(figsize=(12, 6))  # 创建图形
+    bars = plt.bar(class_names, probabilities)  # 绘制柱状图
+    plt.title(title)  # 设置标题
+    plt.xlabel('Class')  # x轴标签
+    plt.ylabel('Probability (%)')  # y轴标签
+    plt.xticks(rotation=45)  # x轴标签旋转45度防止重叠
+    plt.ylim(0, 100)  # y轴范围0-100%
+    
+    # 在每个柱子上方添加数值标签
+    for bar in bars:
+        height = bar.get_height()  # 获取柱子高度
+        plt.text(bar.get_x() + bar.get_width()/2., height,  # 文本位置（x,y）
+                 f'{height:.1f}%',  # 显示1位小数
+                 ha='center', va='bottom')  # 水平居中，垂直底部对齐
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+def create_result_dashboard(audio_class, audio_conf, image_class, image_conf, final_result, save_path=None):
+    """
+    创建综合结果仪表盘（英文标题）
+    功能：整合所有分析结果到一个可视化面板
+    参数：
+        audio_class: 音频分类结果
+        audio_conf: 音频分类置信度（0-100）
+        image_class: 图像分类结果
+        image_conf: 图像分类置信度（0-100）
+        final_result: 最终融合结果
+        save_path: 图片保存路径（可选）
+    原理：使用matplotlib的gridspec创建复杂布局，通过文本和格式展示结果
+    """
+    fig = plt.figure(figsize=(16, 8), constrained_layout=True)  # 创建大尺寸图形
+    gs = fig.add_gridspec(2, 2)  # 2行2列的网格布局
+    
+    # 主标题
+    fig.suptitle(f'Smart Guide System - Multimodal Recognition\nFinal Result: {final_result}', 
+                fontsize=16, fontweight='bold')
+    
+    # 音频结果区域（左上）
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.set_title('Audio Analysis Results', fontsize=12)
+    if audio_class:  # 如果有音频结果
+        ax1.text(0.5, 0.7,  # 文本位置（归一化坐标）
+                f'Predicted Class: {audio_class}\nConfidence: {audio_conf:.1f}%', 
+                ha='center', va='center', fontsize=12)  # 水平垂直居中
+    else:
+        ax1.text(0.5, 0.5, 'Audio Analysis Failed', ha='center', va='center', fontsize=12)
+    ax1.axis('off')  # 隐藏坐标轴
+    
+    # 图像结果区域（右上）
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax2.set_title('Image Analysis Results', fontsize=12)
+    if image_class:
+        ax2.text(0.5, 0.7, f'Predicted Class: {image_class}\nConfidence: {image_conf:.1f}%', 
+                ha='center', va='center', fontsize=12)
+    else:
+        ax2.text(0.5, 0.5, 'Image Analysis Failed', ha='center', va='center', fontsize=12)
+    ax2.axis('off')
+    
+    # 融合分析区域（底部整行）
+    ax3 = fig.add_subplot(gs[1, :])
+    ax3.set_title('Multimodal Fusion Analysis', fontsize=12)
+    
+    # 根据不同的结果组合生成分析文本
+    if audio_class and image_class:
+        if audio_class == image_class:
+            analysis_text = f"Audio and image results match: {audio_class}"
+        else:
+            analysis_text = (
+                f"Audio and image results differ\n"
+                f"Audio: {audio_class} (Confidence: {audio_conf:.1f}%, Weight: {AUDIO_WEIGHT*100}%)\n"
+                f"Image: {image_class} (Confidence: {image_conf:.1f}%, Weight: {IMAGE_WEIGHT*100}%)\n"
+                f"Weighted Score: Audio={audio_conf*AUDIO_WEIGHT:.1f}, Image={image_conf*IMAGE_WEIGHT:.1f}\n"
+                f"Final Decision: {final_result}"
+            )
+    elif audio_class:
+        analysis_text = "Using audio result only"
+    elif image_class:
+        analysis_text = "Using image result only"
+    else:
+        analysis_text = "Both audio and image analysis failed"
+    
+    ax3.text(0.5, 0.5, analysis_text, ha='center', va='center', fontsize=12)
+    ax3.axis('off')
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
+
+# =====================
+# 音频录制函数（增加可视化）
+# =====================
+def record_audio(duration=RECORD_DURATION):
+    """
+    录音功能，同时保存波形图
+    功能：通过串口录制音频并保存为WAV文件
+    参数：
+        duration: 录音时长（秒），默认为配置中的RECORD_DURATION
+    返回：
+        音频文件路径（成功）或None（失败）
+    原理：通过串口读取原始音频数据，保存为WAV格式，同时记录数据用于可视化
+    """
+    # 生成带时间戳的音频文件名
+    filename = os.path.join(AUDIO_SAVE_DIR, f"audio_{int(time.time())}.wav")
+    end_time = time.time() + duration  # 计算录音结束时间
+    
+    try:
+        # 初始化串口连接（8位数据位，无奇偶校验，1位停止位）
+        ser = serial.Serial(RECORD_PORT, RECORD_BAUD, timeout=2)
+        print(f"已连接到串口 {ser.port}")
+    except serial.SerialException as e:
+        print(f"串口连接失败: {e}")
+        return None
+    
+    try:
+        # 创建WAV文件并设置参数
+        with wave.open(filename, 'wb') as wf:
+            wf.setnchannels(1)  # 单声道
+            wf.setsampwidth(2)  # 16位采样（2字节）
+            wf.setframerate(16000)  # 16kHz采样率（Nyquist频率8kHz）
+            
+            print(f"开始录音，将持续 {duration} 秒...")
+            start_time = time.time()
+            
+            # 用于存储音频数据以便可视化
+            audio_data = []
+            
+            # 录音循环
+            while time.time() < end_time:
+                bytes_needed = RECORD_CHUNK_SAMPLES * 2  # 16位=2字节
+                data = ser.read(bytes_needed)  # 从串口读取数据
+                
+                if len(data) != bytes_needed:  # 检查数据是否完整
+                    print(f"警告: 数据不完整 ({len(data)}/{bytes_needed} bytes)")
+                    continue
+                
+                wf.writeframes(data)  # 写入WAV文件
+                # 将字节数据转换为numpy数组（16位有符号整数）
+                samples = np.frombuffer(data, dtype=np.int16)
+                audio_data.extend(samples)  # 添加到音频数据列表
+                
+                # 计算并显示进度
+                elapsed = time.time() - start_time
+                percent = min(100, elapsed / duration * 100)
+                sys.stdout.write(f"\r录制进度: {percent:.1f}%")
+                sys.stdout.flush()
+                
+            print("\n录音完成!")
+            
+            # 保存音频波形图
+            audio_data = np.array(audio_data)
+            waveform_path = os.path.join(current_run_dir, "audio_waveform.png")
+            plot_audio_waveform(audio_data, 16000, waveform_path)
+            print(f"音频波形图已保存: {waveform_path}")
+            
+            return filename  # 返回音频文件路径
+            
+    except Exception as e:
+        print(f"录音过程中出错: {e}")
+        return None
+    finally:
+        ser.close()  # 确保串口关闭
+        print(f"音频已保存为: {os.path.abspath(filename)}")
+        print(f"文件大小: {os.path.getsize(filename)//1024} KB")
+
+# =====================
+# 音频预测函数（增加可视化）
+# =====================
+def predict_audio(file_path):
+    """
+    音频分类预测
+    功能：使用预训练模型对音频进行分类
+    参数：
+        file_path: 音频文件路径
+    返回：
+        元组 (predicted_class, confidence) 或 (None, None)（失败时）
+    原理：提取梅尔频谱特征，输入CNN模型进行分类
+    """
+    try:
+        # 加载预训练音频模型（基于Keras保存的模型）
+        model = tf.keras.models.load_model(AUDIO_MODEL_PATH)
+        print("音频模型加载成功!")
+    except Exception as e:
+        print(f"音频模型加载失败: {e}")
+        return None, None
+    
+    try:
+        # 1. 读取并预处理音频
+        audio = tf.io.read_file(file_path)  # 读取音频文件
+        # 解码WAV文件（单声道，16位PCM）
+        audio, sample_rate = tf.audio.decode_wav(audio, desired_channels=1)
+        audio = tf.squeeze(audio, axis=-1)  # 去除多余的维度（从[样本数,1]到[样本数]）
+        
+        # 2. 统一音频长度（补零或截断）
+        target_length = 16000 * 4  # 目标长度4秒（16000Hz采样率）
+        current_length = tf.shape(audio)[0]  # 当前音频长度
+        audio = audio[:target_length]  # 截断过长的音频
+        pad_length = tf.maximum(target_length - current_length, 0)  # 计算需要补零的长度
+        audio = tf.pad(audio, [[0, pad_length]])  # 在末尾补零
+        
+        # 3. 特征提取 - 短时傅里叶变换
+        # 帧长1024（64ms），帧移512（32ms），FFT点数1024
+        stfts = tf.signal.stft(audio, frame_length=1024, frame_step=512, fft_length=1024)
+        spectrogram = tf.abs(stfts)  # 获取幅度谱
+        
+        # 保存频谱图用于可视化
+        spectrogram_np = spectrogram.numpy()
+        spectrogram_path = os.path.join(current_run_dir, "spectrogram.png")
+        plot_spectrogram(spectrogram_np.T, spectrogram_path)  # 转置使时间轴水平
+        print(f"频谱图已保存: {spectrogram_path}")
+        
+        # 4. 转换为梅尔频谱（模拟人耳听觉特性）
+        mel_matrix = tf.signal.linear_to_mel_weight_matrix(
+            num_mel_bins=128,  # 梅尔频带数
+            num_spectrogram_bins=513,  # 频谱频带数（FFT点数/2 +1）
+            sample_rate=16000,  # 采样率
+            lower_edge_hertz=80.0,  # 最低频率（人耳可听范围约20Hz-20kHz）
+            upper_edge_hertz=7600.0)  # 最高频率
+        
+        mel_spectrogram = tf.tensordot(spectrogram, mel_matrix, 1)  # 矩阵乘法
+        log_mel = tf.math.log(mel_spectrogram + 1e-6)  # 对数变换（加小值防止log(0)）
+        # 标准化（零均值单位方差）
+        mean, variance = tf.nn.moments(log_mel, axes=0)
+        normalized = (log_mel - mean) / tf.sqrt(variance + 1e-6)
+        
+        # 5. 预测
+        input_tensor = tf.expand_dims(normalized, axis=0)  # 添加批次维度
+        input_tensor = tf.expand_dims(input_tensor, axis=-1)  # 添加通道维度
+        predictions = model.predict(input_tensor)  # 模型预测（softmax输出）
+        
+        # 解析预测结果
+        predicted_idx = np.argmax(predictions)  # 获取最高概率的索引
+        predicted_class = AUDIO_CLASS_NAMES[predicted_idx]  # 获取类别名称
+        confidence = np.max(predictions) * 100  # 获取置信度百分比
+        
+        # 打印结果
+        print(f"\n音频预测结果: {predicted_class} (可信度: {confidence:.1f}%)")
+        print("\n音频类别概率分布:")
+        for i, class_name in enumerate(AUDIO_CLASS_NAMES):
+            print(f"{class_name}: {predictions[0][i]*100:.1f}%")
+        
+        # 保存概率分布图
+        prob_path = os.path.join(current_run_dir, "audio_probabilities.png")
+        plot_class_probabilities(AUDIO_CLASS_NAMES, predictions[0]*100, 
+                               "Audio Classification Probabilities", prob_path)
+        print(f"音频概率分布图已保存: {prob_path}")
+        
+        return predicted_class, confidence
+        
+    except Exception as e:
+        print(f"\n音频预测失败: {str(e)}")
+        return None, None
+
+# =====================
+# 图像拍摄函数
+# =====================
+def capture_image():
+    """
+    拍摄图像并保存预览图
+    功能：通过HTTP请求从ESP32-CAM获取图像
+    返回：
+        图像文件路径（成功）或None（失败）
+    原理：向ESP32-CAM的/capture端点发送HTTP GET请求获取JPEG图像
+    """
+    # 生成带时间戳的图像文件名
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(IMAGE_SAVE_DIR, f"photo_{timestamp}.jpg")
+    
+    # 重试机制（提高鲁棒性）
+    for i in range(RETRY_TIMES):
+        try:
+            # 发送HTTP GET请求获取图像（10秒超时）
+            response = requests.get(f"http://{ESP32_IP}/capture", timeout=10)
+            if response.status_code == 200:  # 请求成功
+                # 保存图像文件（二进制写入）
+                with open(filename, "wb") as f:
+                    f.write(response.content)
+                print(f"[成功] 照片已保存至: {filename}")
+                
+                # 显示拍摄的图像
+                img = Image.open(filename)
+                plt.figure(figsize=(8, 6))
+                plt.imshow(img)
+                plt.title("Captured Image")
+                plt.axis('off')
+                
+                # 保存图像预览
+                preview_path = os.path.join(current_run_dir, "image_preview.png")
+                plt.savefig(preview_path, dpi=300, bbox_inches='tight')
+                plt.close()
+                print(f"图像预览已保存: {preview_path}")
+                
+                return filename  # 返回图像文件路径
+            else:
+                print(f"[错误] 服务器返回状态码: {response.status_code}")
+        except Exception as e:
+            print(f"[错误] 抓取失败: {str(e)}")
+        time.sleep(1)  # 失败后等待1秒再重试
+    
+    print(f"[错误] 经过{RETRY_TIMES}次尝试后仍失败")
+    return None
+
+# =====================
+# 图像分类器类（增加可视化）
+# =====================
+class ImageClassifier:
+    def __init__(self):
+        """
+        初始化图像分类器
+        功能：加载预训练图像分类模型
+        原理：从HDF5文件加载Keras模型结构和权重
+        """
+        try:
+            self.model = load_model(IMAGE_MODEL_PATH)  # 加载模型
+            print("图像分类模型加载成功!")
+        except Exception as e:
+            print(f"图像模型加载失败: {e}")
+            raise  # 抛出异常，由调用者处理
+
+    def preprocess_image(self, img_path):
+        """
+        图像预处理流水线
+        功能：准备图像数据供模型使用
+        参数：
+            img_path: 图像文件路径
+        返回：
+            预处理后的图像数组或None（失败时）
+        原理：调整尺寸、归一化、添加批次维度，与训练时预处理一致
+        """
+        try:
+            # 1. 使用PIL读取图像并转换为RGB格式（确保3通道）
+            img = Image.open(img_path).convert('RGB')
+            
+            # 2. 调整尺寸（双线性插值）
+            img = img.resize(IMG_SIZE[::-1])  # PIL使用(width, height)顺序
+            
+            # 3. 转换为numpy数组（形状为(height, width, 3)）
+            img_array = kimage.img_to_array(img)
+            
+            # 4. 数据标准化（与训练时一致）
+            # 原理：将像素值从[0,255]归一化到[-1,1]（假设模型使用tanh激活）
+            img_array = (img_array / 127.5) - 1.0
+            
+            # 5. 添加批次维度（形状变为(1, height, width, 3)）
+            img_array = np.expand_dims(img_array, axis=0)
+            
+            return img_array
+            
+        except Exception as e:
+            print(f"图像预处理失败: {str(e)}")
+            return None
+
+    def classify(self, img_path):
+        """
+        执行图像分类并生成可视化结果
+        功能：对图像进行分类并生成可视化结果
+        参数：
+            img_path: 图像文件路径
+        返回：
+            元组 (predicted_class, confidence) 或 (None, None)（失败时）
+        原理：预处理图像后输入CNN模型，解析softmax输出
+        """
+        try:
+            # 1. 预处理图像
+            img_array = self.preprocess_image(img_path)
+            if img_array is None:  # 预处理失败
+                return None, None
+                
+            # 2. 执行预测（模型输出为各类别概率）
+            predictions = self.model.predict(img_array)
+            predicted_idx = np.argmax(predictions)  # 获取最高概率的索引
+            predicted_class = CLASS_NAMES[predicted_idx]  # 获取类别名称
+            confidence = np.max(predictions) * 100  # 获取置信度百分比
+            
+            # 3. 输出结果
+            print("\n图像分类结果:")
+            print(f"预测类别: {predicted_class} (置信度: {confidence:.1f}%)")
+            print("\n各类别概率分布:")
+            for i, class_name in enumerate(CLASS_NAMES):
+                print(f"{class_name}: {predictions[0][i]*100:.1f}%")
+            
+            # 4. 保存概率分布图
+            prob_path = os.path.join(current_run_dir, "image_probabilities.png")
+            plot_class_probabilities(CLASS_NAMES, predictions[0]*100, 
+                                   "Image Classification Probabilities", prob_path)
+            print(f"图像概率分布图已保存: {prob_path}")
+            
+            # 5. 显示原始图像和预测结果
+            img = Image.open(img_path)
+            plt.figure(figsize=(12, 6))  # 创建12x6英寸的图形
+            
+            # 左侧子图：原始图像
+            plt.subplot(1, 2, 1)
+            plt.imshow(img)
+            plt.title(f"Original Image\nPrediction: {predicted_class} ({confidence:.1f}%)")
+            plt.axis('off')
+            
+            # 右侧子图：概率分布
+            plt.subplot(1, 2, 2)
+            bars = plt.bar(CLASS_NAMES, predictions[0]*100)
+            plt.title('Class Probability Distribution')
+            plt.xlabel('Class')
+            plt.ylabel('Probability (%)')
+            plt.xticks(rotation=45)
+            plt.ylim(0, 100)
+            
+            # 在每个柱子上方添加数值标签
+            for bar in bars:
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2., height,
+                         f'{height:.1f}%',
+                         ha='center', va='bottom')
+            
+            # 保存结果图
+            result_path = os.path.join(current_run_dir, "image_result.png")
+            plt.savefig(result_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"图像分类结果图已保存: {result_path}")
+            
+            return predicted_class, confidence
+            
+        except Exception as e:
+            print(f"图像分类失败: {str(e)}")
+            return None, None
+
+# =====================
+# 结果融合函数（增加可视化）
+# =====================
+def combine_results(audio_class, audio_conf, image_class, image_conf):
+    """
+    融合音频和图像分类结果
+    功能：根据权重融合两种模态的分类结果
+    参数：
+        audio_class: 音频分类结果
+        audio_conf: 音频分类置信度（0-100）
+        image_class: 图像分类结果
+        image_conf: 图像分类置信度（0-100）
+    返回：
+        最终融合结果
+    原理：加权投票法，当结果不一致时选择加权得分高的类别
+    """
+    if audio_class is None and image_class is None:
+        print("警告: 音频和图像分类均失败，无法确定结果")
+        final_result = "Unknown"
+    elif audio_class is None:
+        print("音频分类无效，仅使用图像结果")
+        final_result = image_class
+    elif image_class is None:
+        print("图像分类无效，仅使用音频结果")
+        final_result = audio_class
+    else:
+        if audio_class == image_class:  # 结果一致
+            print(f"音频与图像分类结果一致: {audio_class}")
+            final_result = audio_class
+        else:  # 结果不一致
+            print("\n音频与图像分类结果不一致，进行加权综合:")
+            print(f"音频: {audio_class} (置信度: {audio_conf:.1f}%)")
+            print(f"图像: {image_class} (置信度: {image_conf:.1f}%)")
+            
+            # 计算加权得分
+            audio_score = audio_conf * AUDIO_WEIGHT
+            image_score = image_conf * IMAGE_WEIGHT
+            
+            print(f"音频得分: {audio_score:.2f} ({AUDIO_WEIGHT*100}%权重)")
+            print(f"图像得分: {image_score:.2f} ({IMAGE_WEIGHT*100}%权重)")
+            
+            # 根据加权得分决定最终结果
+            if audio_score > image_score:
+                print("基于加权得分，最终选择音频分类结果")
+                final_result = audio_class
+            else:
+                print("基于加权得分，最终选择图像分类结果")
+                final_result = image_class
+    
+    # 创建并保存结果仪表盘
+    dashboard_path = os.path.join(current_run_dir, "result_dashboard.png")
+    create_result_dashboard(audio_class, audio_conf, image_class, image_conf, final_result, dashboard_path)
+    print(f"结果仪表盘已保存: {dashboard_path}")
+    
+    return final_result
+
+# =====================
+# 主函数
+# =====================
+def main():
+    global current_run_dir  # 声明为全局变量以便其他函数访问
+    
+    print("=" * 70)
+    print("智慧导览系统：多模态区域识别")
+    print("=" * 70)
+    print(f"所有数据将保存到: {os.path.abspath(SAVE_ROOT)}")
+    print(f"音频保存目录: {AUDIO_SAVE_DIR}")
+    print(f"图像保存目录: {IMAGE_SAVE_DIR}")
+    print(f"日志保存目录: {LOG_SAVE_DIR}")
+    print(f"可视化结果目录: {VISUALIZATION_DIR}\n")
+    
+    # 创建本次运行专用的子文件夹（按时间戳命名）
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    current_run_dir = os.path.join(VISUALIZATION_DIR, f"Run_{run_timestamp}")
+    os.makedirs(current_run_dir, exist_ok=True)
+    print(f"本次运行的可视化结果将保存在: {current_run_dir}")
+    
+    # 初始化分类器
+    image_classifier = ImageClassifier()
+    
+    try:
+        # 1. 音频采集与分类
+        print("\n>>> 开始音频录制...")
+        audio_file = record_audio()
+        audio_class, audio_conf = (None, None)
+        if audio_file:
+            print("\n>>> 开始音频分类分析...")
+            audio_class, audio_conf = predict_audio(audio_file)
+        else:
+            print("警告: 音频录制失败，将尝试仅使用图像分类")
+        
+        # 2. 图像拍摄与分类
+        print("\n>>> 开始图像拍摄...")
+        image_file = capture_image()
+        image_class, image_conf = (None, None)
+        if image_file:
+            print("\n>>> 开始图像分类分析...")
+            image_class, image_conf = image_classifier.classify(image_file)
+        else:
+            print("警告: 图像拍摄失败，将尝试仅使用音频分类")
+        
+        # 3. 结果融合
+        print("\n>>> 开始综合分析...")
+        final_result = combine_results(audio_class, audio_conf, image_class, image_conf)
+        
+        # 输出最终结果
+        print("\n" + "=" * 70)
+        print(f"最终区域判定: {final_result}")
+        print("=" * 70)
+        
+        # 保存日志（追加模式）
+        log_path = os.path.join(LOG_SAVE_DIR, "results_log.txt")
+        with open(log_path, "a", encoding='utf-8') as log:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_entry = (
+                f"{timestamp} | 最终判定: {final_result} | "
+                f"音频: {audio_class if audio_class else 'N/A'}({audio_conf if audio_conf else 'N/A'}) | "
+                f"图像: {image_class if image_class else 'N/A'}({image_conf if image_conf else 'N/A'})\n"
+            )
+            log.write(log_entry)
+            print(f"结果已保存至: {os.path.abspath(log_path)}")
+        
+    except KeyboardInterrupt:
+        print("\n程序被用户终止")
+    except Exception as e:
+        print(f"\n系统运行时发生错误: {str(e)}")
+        import traceback
+        traceback.print_exc()  # 打印完整的错误堆栈
+        
+        # 保存错误日志
+        error_log_path = os.path.join(LOG_SAVE_DIR, "error_log.txt")
+        with open(error_log_path, "a", encoding='utf-8') as err_log:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            err_log.write(f"[{timestamp}] 错误: {str(e)}\n")
+            err_log.write(traceback.format_exc() + "\n\n")
+        print(f"错误详情已保存至: {os.path.abspath(error_log_path)}")
+
+if __name__ == "__main__":
+    main()
