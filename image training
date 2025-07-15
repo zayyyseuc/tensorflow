@@ -1,0 +1,257 @@
+# -*- coding: utf-8 -*-
+"""
+强化版图像分类系统（纯Keras版本）
+核心功能：基于双路径卷积神经网络的图像分类系统
+输入要求：统一尺寸的RGB图像
+系统组件：
+1. 图像预处理模块（尺寸调整+标准化）
+2. 数据管道构建模块（自动数据集划分+高效加载）
+3. 双路径卷积神经网络（局部/全局特征融合）
+4. 训练流程（包含早停和模型保存）
+"""
+
+# =====================
+# 基础库导入
+# =====================
+import os  # 提供操作系统相关功能，如文件路径操作
+import numpy as np  # 数值计算库，用于数组操作
+import tensorflow as tf  # 深度学习框架
+from keras import layers, Model, optimizers, callbacks  # Keras高层API组件
+import sys  # 系统相关功能
+import io  # 输入输出流操作
+from PIL import Image  # 图像处理库
+
+# 设置标准输出编码为UTF-8（解决中文编码问题）
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='UTF-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='UTF-8')
+
+# =====================
+# 配置区（用户必须修改部分）
+# =====================
+DATASET_PATH = r"C:/Users/A/Desktop/opencv/images_1"  # 数据集根目录路径（需替换为实际路径）
+CLASS_NAMES = ['A11', 'A12', 'A13', 'A21', 'A22', 'B1', 'B2', 'B3', 'B4', 'C11', 'C12', 'C21', 'C22']  # 分类标签列表（需与子目录前缀严格匹配）
+IMG_SIZE = (240, 320)  # 统一图像尺寸（高度，宽度）
+
+# =====================
+# 数据预处理模块
+# =====================
+def image_preprocess(file_path, label):
+    """图像预处理流水线（TensorFlow图模式）
+    功能：将原始图像转换为标准化张量
+    实现原理：
+    1. 读取解码：使用tf.io读取文件，tf.image解码为RGB
+    2. 尺寸调整：保持比例调整最小边，中心裁剪
+    3. 标准化处理：像素值归一化到[-1,1]范围
+    
+    参数：
+        file_path: 图像文件路径
+        label: 对应的类别标签
+        
+    返回：
+        预处理后的图像张量和标签
+    """
+    try:
+        # 阶段1：读取和解码 ------------------------------------------
+        img = tf.io.read_file(file_path)  # 读取图像文件原始数据
+        img = tf.image.decode_jpeg(img, channels=3)  # 解码JPEG为RGB格式(3通道)
+        
+        # 阶段2：尺寸标准化 ------------------------------------------
+        img = tf.image.resize(img, IMG_SIZE, method='bilinear')  # 双线性插值调整尺寸
+        
+        # 阶段3：数据增强（训练时随机增强）---------------------------
+        if tf.random.uniform(()) > 0.5:  # 生成0-1随机数，50%概率执行
+            img = tf.image.flip_left_right(img)  # 水平翻转图像
+        
+        # 阶段4：数据标准化 ------------------------------------------
+        img = tf.image.convert_image_dtype(img, tf.float32)  # 转换到[0,1]范围
+        img = (img - 0.5) * 2.0  # 归一化到[-1,1]范围（符合神经网络输入要求）
+
+        return img, label
+
+    except Exception as e:
+        # 错误处理：返回全零图像避免训练中断
+        tf.print(f"处理失败: {file_path}, 错误: {str(e)}")
+        return tf.zeros((*IMG_SIZE, 3), dtype=tf.float32), label
+
+# =====================
+# 数据管道构建
+# =====================
+def build_datasets(data_dir, batch_size=32):
+    """构建高效数据流水线
+    功能实现：
+    1. 递归扫描数据集目录结构
+    2. 收集文件路径和对应标签
+    3. 8:2比例随机划分训练/验证集
+    4. 创建支持并行预处理的Dataset对象
+    
+    参数：
+        data_dir: 数据集根目录路径
+        batch_size: 批处理大小（默认32）
+        
+    返回：
+        train_dataset: 训练集数据管道
+        val_dataset: 验证集数据管道
+    """
+    print(f"\n正在扫描数据集路径: {os.path.abspath(data_dir)}")
+
+    # 阶段1：文件收集 ----------------------------------------------
+    file_paths = []  # 存储所有图像文件路径
+    labels = []  # 存储对应的类别标签
+    
+    # 遍历每个类别目录
+    for class_idx, class_name in enumerate(CLASS_NAMES):
+        class_dir = os.path.join(data_dir, f"{class_name}_samples")  # 构建类别目录路径
+        if not os.path.exists(class_dir):
+            raise FileNotFoundError(f"目录不存在: {class_dir}")
+            
+        # 递归扫描目录下所有图像文件
+        for root, _, files in os.walk(class_dir):
+            for file in files:
+                if file.lower().endswith(('.jpg', '.jpeg', '.png')):  # 检查文件扩展名
+                    file_paths.append(os.path.join(root, file))  # 记录完整路径
+                    labels.append(class_idx)  # 记录类别索引
+
+    if len(file_paths) == 0:
+        raise FileNotFoundError("未找到任何图像文件,请检查路径和文件格式")
+
+    # 阶段2：数据随机化 --------------------------------------------
+    indices = np.random.permutation(len(file_paths))  # 生成随机排列索引
+    file_paths = np.array(file_paths)[indices]  # 打乱文件路径顺序
+    labels = np.array(labels)[indices]  # 同步打乱标签顺序
+
+    # 阶段3：数据集划分 --------------------------------------------
+    split = int(0.8 * len(file_paths))  # 计算80%分割点
+    train_files = file_paths[:split]  # 前80%作为训练集
+    train_labels = labels[:split]
+    val_files = file_paths[split:]  # 后20%作为验证集
+    val_labels = labels[split:]
+
+    # 打印数据集统计信息
+    print(f"数据集统计:")
+    print(f"- 总样本数: {len(file_paths)}")
+    print(f"- 训练集: {len(train_files)}")
+    print(f"- 验证集: {len(val_files)}")
+
+    # 阶段4：Dataset流水线构建 ---------------------------------------
+    def create_dataset(files, labels):
+        """创建TensorFlow数据管道"""
+        # 创建基础数据集
+        # 并行预处理
+        # 过滤处理失败的样本
+        # 按批次组织数据
+        return tf.data.Dataset.from_tensor_slices((files, labels)) \
+            .map(image_preprocess, num_parallel_calls=tf.data.AUTOTUNE) \
+            .filter(lambda x,y: tf.reduce_sum(x) != 0.0)\
+            .batch(batch_size) \
+            .prefetch(tf.data.AUTOTUNE)  # 预加载优化
+
+    return create_dataset(train_files, train_labels), create_dataset(val_files, val_labels)
+
+# =====================
+# 神经网络模型
+# =====================
+def create_model(input_shape=(240, 320, 3)):
+    """构建双路径卷积神经网络
+    功能：同时提取高频（局部细节）和低频（全局结构）特征
+    实现原理：
+    1. 高频路径：小卷积核捕捉局部特征
+    2. 低频路径：大卷积核捕捉全局特征
+    3. 特征融合：拼接双路径特征后分类
+    
+    参数：
+        input_shape: 输入图像形状（高度，宽度，通道）
+        
+    返回：
+        编译好的Keras模型实例
+    """
+    # 输入层（接收指定尺寸的RGB图像）
+    inputs = layers.Input(shape=input_shape)
+    
+    # 高频特征路径（3x3小卷积核捕捉局部细节）-------------------------
+    high = layers.Conv2D(32, (3,3), padding='same', activation='relu')(inputs)  # 第一卷积层
+    high = layers.MaxPool2D((2, 2))(high)  # 下采样到160x120
+    high = layers.Conv2D(64, (3,3), padding='same', activation='relu')(high)  # 第二卷积层
+    high = layers.MaxPool2D((2, 2))(high)  # 下采样到80x60
+
+    # 低频特征路径（7x7大卷积核捕捉全局结构）-------------------------
+    low = layers.Conv2D(32, (7,7), strides=2, padding='same', activation='relu')(inputs)  # 长步长卷积直接下采样
+    low = layers.Conv2D(64, (7,7), strides=2, padding='same', activation='relu')(low)  # 二次下采样
+    
+    # 特征融合 ---------------------------------------------------
+    merged = layers.Concatenate(axis=-1)([high, low])  # 通道维度拼接双路径特征
+    merged = layers.Conv2D(128, (3,3), activation='relu')(merged)  # 融合特征
+    merged = layers.GlobalAvgPool2D()(merged)  # 全局平均池化降维
+
+    # 输出层 -----------------------------------------------------
+    outputs = layers.Dense(len(CLASS_NAMES), activation='softmax')(merged)  # 多分类输出
+    
+    return Model(inputs, outputs)  # 构建完整模型
+
+# =====================
+# 训练流程
+# =====================
+def main():
+    """主训练流程
+    执行步骤：
+    1. 数据集加载与预处理
+    2. 模型构建与编译
+    3. 训练过程监控
+    4. 结果输出与错误处理
+    """
+    try:
+        # 阶段1：数据集初始化
+        print("\n====== 正在加载数据集 ======")
+        train_dataset, val_dataset = build_datasets(DATASET_PATH)  # 构建数据管道
+
+        # 阶段2：模型构建
+        print("\n====== 正在构建模型 ======")
+        model = create_model()  # 创建双路径CNN
+        model.compile(
+            optimizer=optimizers.Adam(learning_rate=0.001),  # 使用Adam优化器
+            loss='sparse_categorical_crossentropy',  # 稀疏分类交叉熵
+            metrics=['accuracy']  # 监控准确率
+        )
+        model.summary()  # 打印模型结构
+
+        # 阶段3：回调配置
+        callbacks_list = [
+            callbacks.EarlyStopping(  # 早停机制
+                patience=10,  # 10轮无改善则停止
+                restore_best_weights=True  # 恢复最佳权重
+            ),
+            callbacks.ModelCheckpoint(  # 模型保存
+                'best_image_model.keras',  # 保存路径
+                save_best_only=True,  # 只保存最佳模型
+                monitor='val_accuracy',  # 监控验证准确率
+                mode='max'  # 最大化模式
+            )
+        ]
+
+        # 阶段4：模型训练
+        print("\n====== 开始训练 ======")
+        history = model.fit(
+            train_dataset,
+            validation_data=val_dataset,  # 验证集
+            epochs=100,  # 最大训练轮次
+            callbacks=callbacks_list,  # 回调函数
+            verbose=2  # 详细输出模式
+        )
+
+        # 阶段5：训练结果输出
+        print("\n====== 训练完成 ======")
+        print(f"最佳验证准确率: {max(history.history['val_accuracy']):.4f}")  # 输出最佳性能
+
+    except Exception as e:
+        # 异常处理流程
+        print("\n====== 发生错误 ======")
+        print(f"错误类型: {type(e).__name__}")
+        print(f"错误详情: {str(e)}")
+        print("\n排错建议:")
+        print("1. 确认已安装 keras、tensorflow 及相关依赖")
+        print("2. 检查DATASET_PATH路径是否正确")
+        print("3. 确认所有类别目录都存在（命名格式：类别名_samples）")
+        print("4. 确保图像文件为常见格式（jpg/png）且未损坏")
+        print("5. 检查图像尺寸是否合理（建议240x320或更高）")
+
+if __name__ == "__main__":
+    main()  # 执行主函数
