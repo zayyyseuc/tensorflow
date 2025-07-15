@@ -1,0 +1,173 @@
+/* 
+ * ESP32 摄像头实时图传程序
+ * 功能：通过WiFi提供实时JPEG图像流，支持浏览器访问/capture获取自动刷新的图像
+ * 硬件：ESP32 + OV2640摄像头模块
+ * 实现原理：基于ESP32的WiFi和摄像头驱动能力，搭建异步Web服务器，实时传输JPEG压缩图像
+ */
+
+// 引入必要库文件
+#include <WiFi.h>              // 提供WiFi连接功能，处理TCP/IP协议栈
+#include <ESPAsyncWebServer.h> // 异步Web服务器库，支持非阻塞式请求处理，提高并发性能
+#include "esp_camera.h"        // ESP32专用摄像头驱动，提供底层硬件控制接口
+
+/* ====== 硬件引脚配置 ====== */
+// OV2640模块与ESP32的物理连接配置（根据具体模块原理图调整）
+#define PWDN_GPIO_NUM     32   // 电源使能引脚：高电平关闭摄像头电源，低电平启用
+#define RESET_GPIO_NUM    -1   // 硬件复位引脚：-1表示未连接，使用软件复位
+#define XCLK_GPIO_NUM      0   // 系统主时钟输出：为摄像头提供基准时钟（典型值20MHz）
+#define SIOD_GPIO_NUM     26   // I2C数据线（SDA）：用于配置摄像头寄存器参数
+#define SIOC_GPIO_NUM     27   // I2C时钟线（SCL）：与SDA配合完成I2C通信
+// 摄像头并行数据总线（8位）
+#define Y9_GPIO_NUM       35   // 数据位D7（最高位），组成像素数据的字节
+#define Y8_GPIO_NUM       34   // 数据位D6
+#define Y7_GPIO_NUM       39   // 数据位D5
+#define Y6_GPIO_NUM       36   // 数据位D4
+#define Y5_GPIO_NUM       21   // 数据位D3
+#define Y4_GPIO_NUM       19   // 数据位D2
+#define Y3_GPIO_NUM       18   // 数据位D1
+#define Y2_GPIO_NUM        5   // 数据位D0（最低位）
+// 同步控制信号
+#define VSYNC_GPIO_NUM    25   // 垂直同步信号：帧开始/结束标志，用于图像帧同步
+#define HREF_GPIO_NUM     23   // 水平参考信号：行有效标志，高电平期间传输有效像素
+#define PCLK_GPIO_NUM     22   // 像素时钟：每个上升沿传输一个像素数据
+
+/* ====== 网络配置 ====== */
+const char* ssid = "Your_SSID";      // 2.4GHz WiFi网络SSID（5GHz不支持）
+const char* password = "Your_PASS";  // WiFi密码（建议长度8-63字符）
+
+AsyncWebServer server(80);     // 创建异步Web服务器实例，监听标准HTTP端口80
+uint32_t lastCaptureTime = 0;  // 最后捕获时间戳：用于计算帧间隔，调试传输性能
+
+/* ====== 摄像头初始化函数 ====== */
+bool initCamera() {
+  camera_config_t config;  // 摄像头配置结构体，包含硬件参数和性能设置
+
+  // 引脚映射配置：将逻辑引脚编号与实际GPIO引脚对应
+  config.pin_pwdn  = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.pin_xclk  = XCLK_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM; // I2C数据线（SDA）
+  config.pin_sscb_scl = SIOC_GPIO_NUM; // I2C时钟线（SCL）
+  // 配置8位数据总线引脚（Y2为LSB，Y9为MSB）
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d0 = Y2_GPIO_NUM;
+  // 同步信号引脚配置
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href  = HREF_GPIO_NUM;
+  config.pin_pclk  = PCLK_GPIO_NUM;
+
+  // 性能参数配置
+  config.xclk_freq_hz = 20000000;   // 20MHz时钟：平衡图像质量与功耗
+  config.pixel_format = PIXFORMAT_JPEG; // 输出JPEG格式：节省带宽，适合网络传输
+  config.frame_size  = FRAMESIZE_QVGA; // 分辨率320x240：适合实时传输
+  config.jpeg_quality = 10;         // JPEG压缩质量：0（最高）-63（最低），值越小质量越高
+  config.fb_count = 2;              // 双缓冲机制：提高帧采集效率，减少丢帧
+
+  // 硬件稳定性优化
+  pinMode(SIOD_GPIO_NUM, INPUT_PULLUP); // 启用内部上拉电阻，增强I2C信号稳定性
+  pinMode(SIOC_GPIO_NUM, INPUT_PULLUP);
+  delay(500);  // 等待500ms确保摄像头电源稳定
+
+  // 带错误重试的初始化机制（最多尝试5次）
+  esp_err_t err; // 存储ESP32底层API返回状态
+  for(int i=0; i<5; i++){
+    err = esp_camera_init(&config); // 调用ESP-IDF摄像头初始化函数
+    if(err == ESP_OK) break;        // 成功时跳出循环
+    Serial.printf("初始化失败 错误码0x%x，第%d次重试\n", err, i+1);
+    delay(1000); // 重试间隔1秒，避免连续失败
+  }
+  return (err == ESP_OK); // 返回初始化状态（true=成功）
+}
+
+/* ====== 图像捕获请求处理 ====== */
+void handleCapture(AsyncWebServerRequest *request) {
+  unsigned long startTime = millis(); // 记录处理开始时间，用于性能分析
+  
+  // 获取摄像头帧缓冲区（包含最新JPEG图像数据）
+  camera_fb_t *fb = esp_camera_fb_get();
+  if(!fb) { // 错误处理：帧获取失败
+    request->send(500, "text/plain", "图像捕获失败"); // 返回HTTP 500错误
+    return; // 提前退出函数
+  }
+
+  /* 构建HTTP响应：
+   * 1. 使用beginResponse_P直接发送PROGMEM中的响应头
+   * 2. 设置MIME类型为image/jpeg，告知浏览器这是图像数据
+   * 3. 将帧缓冲区中的JPEG数据指针和长度作为响应内容 */
+  AsyncWebServerResponse *response = request->beginResponse_P(
+    200, 
+    "image/jpeg",    // MIME类型标识图像格式
+    fb->buf,         // 指向JPEG数据缓存的指针
+    fb->len          // 图像数据字节长度
+  );
+  response->addHeader("Refresh", "3");     // 自动刷新指令：3秒后重新请求页面
+  response->addHeader("Cache-Control", "no-cache"); // 禁用浏览器缓存，获取最新帧
+  request->send(response); // 发送完整HTTP响应
+
+  // 释放帧缓冲区资源（关键步骤，防止内存泄漏）
+  esp_camera_fb_return(fb);
+  
+  // 调试信息输出：处理耗时和图像大小
+  lastCaptureTime = millis();
+  Serial.printf("捕获耗时: %lums 图像大小: %d字节\n", millis()-startTime, fb->len);
+}
+
+/* ====== 系统初始化 ====== */
+void setup() {
+  Serial.begin(115200);          // 初始化串口通信，波特率115200（与监视器匹配）
+  Serial.setDebugOutput(true);   // 启用详细调试输出（包括库内部日志）
+
+  // 摄像头初始化（带故障处理）
+  if(!initCamera()) {
+    Serial.println("摄像头初始化失败，5秒后重启...");
+    delay(5000);
+    ESP.restart(); // 硬件故障时重启设备（看门狗机制）
+  }
+
+  // WiFi连接流程
+  WiFi.begin(ssid, password); // 启动STA模式连接指定AP
+  Serial.print("正在连接WiFi");
+  unsigned long wifiTimeout = millis() + 30000; // 设置30秒连接超时
+  while(WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print("."); // 输出连接进度指示
+    if(millis() > wifiTimeout) { // 超时处理
+      Serial.println("\n连接超时，重启设备");
+      ESP.restart(); // 重启尝试恢复网络
+    }
+  }
+  Serial.printf("\n连接成功! IP地址: %s\n", WiFi.localIP().toString().c_str());
+
+  // Web服务器配置
+  server.on("/capture", HTTP_GET, handleCapture); // 绑定GET请求到处理函数
+  server.begin(); // 启动HTTP服务器（默认监听80端口）
+  Serial.println("HTTP服务器已启动");
+}
+
+/* ====== 主循环 ====== */
+void loop() {
+  // WiFi连接状态监控（每5秒检查一次）
+  static unsigned long lastCheck = 0;
+  if(millis() - lastCheck > 5000) {
+    lastCheck = millis();
+    if(WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi连接丢失，尝试重连...");
+      WiFi.reconnect(); // 主动触发重连（需配合WiFi.setAutoReconnect）
+    }
+  }
+
+  // 心跳指示灯（需外接LED到GPIO33）
+  static unsigned long lastBlink = 0;
+  if(millis() - lastBlink > 1000) {
+    lastBlink = millis();
+    digitalWrite(33, !digitalRead(33)); // 翻转LED状态（1Hz闪烁）
+  }
+
+  delay(2); // 释放CPU时间（避免100%占用，影响后台任务）
+}
